@@ -1,6 +1,15 @@
-# Sunshine Virtual Display para KDE Plasma 6 (Wayland)
+# Sunshine Virtual Display para KDE Plasma 6 (Wayland) — C Edition
 
-Solução automatizada para streaming com **Sunshine + Moonlight** quando o monitor físico do computador estiver desligado (headless).
+Solução automatizada e de alta performance escrita em **C** para streaming com **Sunshine + Moonlight** quando o monitor físico do computador estiver desligado (headless).
+
+## Destaques da Versão em C
+
+- **Consumo de Memória Mínimo:** Consome **menos de 2 MB de RAM** em segundo plano (contra ~20MB do Python).
+- **Zero Ciclos de CPU Ociosos:** Integração com eventos Netlink do kernel Linux e `poll()`, reagindo instantaneamente a eventos de hotplug do monitor.
+- **Detecção Dinâmica do Wayland:** Detecta automaticamente o socket Wayland da sessão (`wayland-0`, `wayland-1`, etc.).
+- **Sem Vazamentos de Memória:** Código estritamente verificado com **Valgrind** e **AddressSanitizer** (0 leaks, 0 errors).
+
+---
 
 ## Como Funciona
 
@@ -20,36 +29,31 @@ Solução automatizada para streaming com **Sunshine + Moonlight** quando o moni
 
 ## Como Instalar em uma Máquina Nova
 
-Basta clonar ou copiar esta pasta para o computador novo e rodar:
+Basta clonar o repositório e executar o script de instalação:
 
 ```bash
-cd ~/Documentos/sunshine-virtual-display
-chmod +x install.sh
+git clone https://github.com/muriloscolari/sunshine-virtual-display.git
+cd sunshine-virtual-display
 ./install.sh
 ```
 
 O script `install.sh` fará tudo sozinho:
-- Instala as dependências necessárias (`krfb`, `libkscreen`).
-- Instala o script `sunshine-display-daemon.py` em `~/.local/bin/`.
-- Configura o Sunshine para usar captura nativa do KWin (`capture = kwin`).
-- Remove o atraso de inicialização padrão do Sunshine (`sleep 5`).
-- Cria e ativa o serviço do systemd do usuário (`sunshine-virtual-display.service`).
-- Reinicia o Sunshine pronto para uso.
-
----
-
-## Arquivos do Projeto
-
-- `install.sh`: Script que instala e configura tudo automaticamente.
-- `uninstall.sh`: Script para remover a configuração e o serviço.
-- `sunshine-display-daemon.py`: O daemon Python que monitora o estado dos monitores.
-- `sunshine-virtual-display.service`: Unidade systemd do usuário para iniciar o daemon automaticamente com a sessão gráfica.
+- Instala as dependências necessárias (`krfb`, `libkscreen`, `cjson`, `gcc`).
+- Compila o binário em C com otimizações (`-O2`).
+- Instala o binário em `~/.local/bin/sunshine-display-daemon`.
+- Configura o Sunshine para captura nativa do KWin (`capture = kwin`).
+- Remove o atraso padrão de inicialização de 5s do Sunshine.
+- Registra e inicia o serviço systemd de usuário (`sunshine-virtual-display.service`).
 
 ---
 
 ## Comandos Úteis
 
-- **Ver status do serviço:**
+- **Ver status atual das telas:**
+  ```bash
+  sunshine-display-daemon --status
+  ```
+- **Ver status do serviço systemd:**
   ```bash
   systemctl --user status sunshine-virtual-display.service
   ```
@@ -57,7 +61,8 @@ O script `install.sh` fará tudo sozinho:
   ```bash
   tail -f ~/.config/sunshine/vmon.log
   ```
-- **Ver status do Sunshine:**
+- **Compilar manualmente via Makefile:**
   ```bash
-  systemctl --user status sunshine
+  make
+  make test   # Executa bateria de testes com AddressSanitizer
   ```

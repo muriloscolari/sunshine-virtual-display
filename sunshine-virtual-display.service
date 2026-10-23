@@ -1,13 +1,13 @@
 [Unit]
-Description=Sunshine Virtual Display Auto Manager
+Description=Sunshine Virtual Display Auto Manager (C Edition)
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/.local/bin/sunshine-display-daemon.py
+ExecStart=%h/.local/bin/sunshine-display-daemon
 Restart=always
-RestartSec=3
+RestartSec=2
 
 [Install]
 WantedBy=default.target

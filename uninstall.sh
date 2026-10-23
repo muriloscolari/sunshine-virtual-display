@@ -15,6 +15,7 @@ systemctl --user disable sunshine-virtual-display.service 2>/dev/null || true
 
 echo "Removendo arquivos instalados..."
 rm -f "${HOME}/.config/systemd/user/sunshine-virtual-display.service"
+rm -f "${HOME}/.local/bin/sunshine-display-daemon"
 rm -f "${HOME}/.local/bin/sunshine-display-daemon.py"
 rm -f "${HOME}/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/override.conf"
 
