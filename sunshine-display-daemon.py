@@ -27,7 +27,18 @@ logging.basicConfig(
 uid = os.getuid()
 runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
 os.environ["XDG_RUNTIME_DIR"] = runtime_dir
-os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
+
+def detect_wayland_display():
+    env_w = os.environ.get("WAYLAND_DISPLAY")
+    if env_w and os.path.exists(os.path.join(runtime_dir, env_w)):
+        return env_w
+    socks = sorted(glob.glob(os.path.join(runtime_dir, "wayland-[0-9]*")), reverse=True)
+    valid_socks = [os.path.basename(s) for s in socks if not s.endswith(".lock")]
+    if valid_socks:
+        return valid_socks[0]
+    return "wayland-0"
+
+os.environ["WAYLAND_DISPLAY"] = detect_wayland_display()
 os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
 os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
 
@@ -44,6 +55,8 @@ def get_kwin_state():
     """Retorna lista de nomes de displays físicos conectados e virtuais no KWin."""
     physical = []
     virtual = []
+    # Atualiza WAYLAND_DISPLAY caso o compositor tenha mudado de socket
+    os.environ["WAYLAND_DISPLAY"] = detect_wayland_display()
     try:
         out = subprocess.check_output(["kscreen-doctor", "-j"], stderr=subprocess.DEVNULL)
         data = json.loads(out)
