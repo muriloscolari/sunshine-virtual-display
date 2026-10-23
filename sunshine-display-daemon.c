@@ -258,44 +258,29 @@ static void start_vmon(void) {
         _exit(1);
     } else if (pid > 0) {
         g_vmon_pid = pid;
-        usleep(500000); /* 0.5s para o KWin registrar */
+        usleep(600000); /* 0.6s para o KWin registrar */
 
-        char disable_cmd[512] = "";
-        char phys[16][64];
-        int count = 0;
-        if (get_kwin_state(phys, &count, 16)) {
-            for (int i = 0; i < count; i++) {
-                char part[128];
-                snprintf(part, sizeof(part), " output.%.60s.disable", phys[i]);
-                strncat(disable_cmd, part, sizeof(disable_cmd) - strlen(disable_cmd) - 1);
-            }
-        }
-
-        char doctor_cmd[1024];
+        char doctor_cmd[512];
         snprintf(doctor_cmd, sizeof(doctor_cmd),
-                 "kscreen-doctor output.%s.enable output.%s.priority.1 output.%s.mode.%sx%s@%s%s 2>/dev/null",
-                 VMON_OUTPUT, VMON_OUTPUT, VMON_OUTPUT, RES_W, RES_H, FPS, disable_cmd);
+                 "kscreen-doctor output.%s.enable output.%s.priority.1 output.%s.mode.%sx%s@%s 2>/dev/null",
+                 VMON_OUTPUT, VMON_OUTPUT, VMON_OUTPUT, RES_W, RES_H, FPS);
         run_cmd_quiet(doctor_cmd);
 
         log_msg("Tela virtual %s ativa como tela principal (PID %d).", VMON_OUTPUT, (int)g_vmon_pid);
 
-        /* Reinicia o Sunshine para vincular à nova tela virtual */
+        /* Reinicia o Sunshine para vincular à nova tela virtual se ele não estiver com display */
         run_cmd_quiet("systemctl --user restart sunshine 2>/dev/null");
-        log_msg("Sunshine reiniciado e pronto para conexões na tela virtual.");
+        log_msg("Sunshine pronto para conexões na tela virtual.");
     }
 }
 
 static void stop_vmon(void) {
-    log_msg("Monitor físico (%s) LIGADO detectado! Reativando tela física e desligando virtual...", g_last_physical_output);
+    log_msg("Monitor físico (%s) LIGADO detectado! Aguardando estabilização do hardware...", g_last_physical_output);
 
-    char doctor_cmd[256];
-    snprintf(doctor_cmd, sizeof(doctor_cmd),
-             "kscreen-doctor output.%.60s.enable output.%.60s.priority.1 2>/dev/null",
-             g_last_physical_output, g_last_physical_output);
-    run_cmd_quiet(doctor_cmd);
-    run_cmd_quiet("kscreen-doctor --dpms on 2>/dev/null");
-    usleep(300000);
+    /* Aguarda 2 segundos para o DisplayPort concluir link training naturalmente */
+    sleep(2);
 
+    /* Encerra a tela virtual de forma limpa */
     if (g_vmon_pid > 0) {
         kill(g_vmon_pid, SIGTERM);
         int status;
@@ -312,13 +297,14 @@ static void stop_vmon(void) {
         g_vmon_pid = -1;
     }
     run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' 2>/dev/null");
-    usleep(300000);
+    usleep(400000);
 
-    snprintf(doctor_cmd, sizeof(doctor_cmd), "kscreen-doctor output.%s.priority.1 2>/dev/null", g_last_physical_output);
+    /* Garante prioridade no monitor físico sem forçar atomic enable redundante */
+    char doctor_cmd[256];
+    snprintf(doctor_cmd, sizeof(doctor_cmd), "kscreen-doctor output.%.60s.priority.1 2>/dev/null", g_last_physical_output);
     run_cmd_quiet(doctor_cmd);
 
     log_msg("Tela virtual encerrada. Imagem transferida para o monitor físico %s com sucesso.", g_last_physical_output);
-    run_cmd_quiet("systemctl --user restart sunshine 2>/dev/null");
 }
 
 static void cleanup(void) {
