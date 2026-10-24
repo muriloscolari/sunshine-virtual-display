@@ -26,7 +26,6 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
-#include <cjson/cJSON.h>
 
 #define VMON_NAME "sunshine-vmon"
 #define VMON_OUTPUT "Virtual-sunshine-vmon"
@@ -69,21 +68,20 @@ static void log_msg(const char *fmt, ...) {
     va_end(args);
 }
 
-static void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    pid_t pid;
-    while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
-        if (pid == g_vmon_pid) {
-            g_vmon_pid = -1;
-        }
-    }
-    errno = saved_errno;
-}
-
 static void sigterm_handler(int sig) {
     (void)sig;
     g_keep_running = 0;
+}
+
+/* Verifica e recolhe processo filho da tela virtual de forma síncrona (sem race condition de SIGCHLD) */
+static void reap_vmon_if_exited(void) {
+    if (g_vmon_pid > 1) {
+        int status;
+        pid_t w = waitpid(g_vmon_pid, &status, WNOHANG);
+        if (w == g_vmon_pid || (w == -1 && errno == ECHILD)) {
+            g_vmon_pid = -1;
+        }
+    }
 }
 
 /* Detecta dinamicamente o socket wayland ativo (ex: wayland-0, wayland-1) */
@@ -220,7 +218,8 @@ static bool has_physical_monitor(void) {
 }
 
 static void start_vmon(void) {
-    if (g_vmon_pid > 0 && kill(g_vmon_pid, 0) == 0) {
+    reap_vmon_if_exited();
+    if (g_vmon_pid > 1 && kill(g_vmon_pid, 0) == 0) {
         return;
     }
 
@@ -254,7 +253,7 @@ static void start_vmon(void) {
         };
         execvp("krfb-virtualmonitor", args);
         _exit(1);
-    } else if (pid > 0) {
+    } else if (pid > 1) {
         g_vmon_pid = pid;
         usleep(800000); /* 0.8s para o KWin registrar a nova tela virtual */
 
@@ -273,6 +272,34 @@ static void start_vmon(void) {
     }
 }
 
+static void terminate_vmon_process(void) {
+    pid_t target_pid = g_vmon_pid;
+    g_vmon_pid = -1;
+
+    /*
+     * CRÍTICO: Jamais chamar kill() se target_pid <= 1.
+     * No POSIX, kill(-1, SIGKILL) mata TODOS os processos do usuário (derrubando a sessão)!
+     */
+    if (target_pid > 1) {
+        kill(target_pid, SIGTERM);
+        int status;
+        bool exited = false;
+        for (int i = 0; i < 15; i++) {
+            pid_t w = waitpid(target_pid, &status, WNOHANG);
+            if (w == target_pid || (w == -1 && errno == ECHILD)) {
+                exited = true;
+                break;
+            }
+            usleep(100000);
+        }
+        if (!exited) {
+            kill(target_pid, SIGKILL);
+            waitpid(target_pid, &status, 0);
+        }
+    }
+    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' >/dev/null 2>&1");
+}
+
 static void stop_vmon(void) {
     log_msg("Monitor físico (%s) LIGADO detectado! Aguardando estabilização do sinal DisplayPort...", g_last_physical_output);
 
@@ -285,10 +312,8 @@ static void stop_vmon(void) {
     refresh_environment();
 
     /*
-     * REGRA DE OURO DA ESTABILIDADE:
      * PASSO 1: Ativa o monitor físico e define-o como prioridade 1 ENQUANTO a tela virtual
-     * AINDA ESTÁ VIVA. Dessa forma o KWin NUNCA fica com 0 telas ativas, impedindo crashes
-     * do kwin_wayland e da sessão Plasma.
+     * AINDA ESTÁ VIVA. Dessa forma o KWin nunca fica com 0 telas ativas.
      */
     char doctor_cmd[512];
     snprintf(doctor_cmd, sizeof(doctor_cmd),
@@ -312,42 +337,20 @@ static void stop_vmon(void) {
         return;
     }
 
-    /* Aguarda 1.5s para o KWin renderizar as janelas e barras no monitor físico */
-    usleep(1500000);
+    /* Aguarda 1.0s para o KWin renderizar as janelas e barras no monitor físico */
+    usleep(1000000);
 
     /*
-     * PASSO 2: Agora que o monitor físico já é a tela principal ativa, encerra
-     * a tela virtual de forma segura e limpa.
+     * PASSO 2: Encerra o processo da tela virtual com segurança total (PID > 1).
      */
-    if (g_vmon_pid > 0) {
-        kill(g_vmon_pid, SIGTERM);
-        int status;
-        for (int i = 0; i < 15; i++) {
-            if (waitpid(g_vmon_pid, &status, WNOHANG) > 0) {
-                break;
-            }
-            usleep(100000);
-        }
-        if (kill(g_vmon_pid, 0) == 0) {
-            kill(g_vmon_pid, SIGKILL);
-            waitpid(g_vmon_pid, NULL, 0);
-        }
-        g_vmon_pid = -1;
-    }
-    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' >/dev/null 2>&1");
+    terminate_vmon_process();
     usleep(300000);
 
     log_msg("Tela virtual encerrada. Imagem transferida para o monitor físico %s com sucesso.", g_last_physical_output);
 }
 
 static void cleanup(void) {
-    if (g_vmon_pid > 0) {
-        kill(g_vmon_pid, SIGTERM);
-        usleep(200000);
-        waitpid(g_vmon_pid, NULL, WNOHANG);
-        g_vmon_pid = -1;
-    }
-    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' >/dev/null 2>&1");
+    terminate_vmon_process();
     log_msg("Daemon encerrado.");
 }
 
@@ -375,7 +378,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         if (strcmp(argv[1], "--version") == 0) {
-            printf("sunshine-display-daemon (C edition) v2.1\n");
+            printf("sunshine-display-daemon (C edition) v2.2\n");
             return 0;
         }
         if (strcmp(argv[1], "--help") == 0) {
@@ -389,13 +392,7 @@ int main(int argc, char *argv[]) {
         max_test_iterations = atoi(argv[2]);
     }
 
-    /* Configura sinais */
-    struct sigaction sa_chld;
-    memset(&sa_chld, 0, sizeof(sa_chld));
-    sa_chld.sa_handler = sigchld_handler;
-    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa_chld, NULL);
-
+    /* Configura sinais (sem SIGCHLD assíncrono para evitar race condition no g_vmon_pid) */
     struct sigaction sa_term;
     memset(&sa_term, 0, sizeof(sa_term));
     sa_term.sa_handler = sigterm_handler;
@@ -439,6 +436,8 @@ int main(int argc, char *argv[]) {
         if (max_test_iterations > 0 && ++iteration > max_test_iterations) {
             break;
         }
+
+        reap_vmon_if_exited();
 
         /* Espera evento do kernel ou timeout de 1 segundo */
         int ret = 0;
