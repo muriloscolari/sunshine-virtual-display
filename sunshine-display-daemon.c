@@ -3,8 +3,9 @@
  * Escrito em C para consumo mínimo de recursos (RAM < 2MB, 0% CPU).
  *
  * Monitora continuamente o estado dos monitores:
- * - Se o monitor físico for desligado: cria imediatamente tela virtual 1920x1080.
- * - Se o monitor físico for ligado: reativa o monitor físico e desliga a tela virtual.
+ * - Se o monitor físico for desligado: cria tela virtual 1920x1080 para Sunshine/Moonlight.
+ * - Se o monitor físico for ligado: ativa o monitor físico como principal no KWin ANTES
+ *   de encerrar a tela virtual, garantindo estabilidade e impedindo que a sessão feche.
  */
 
 #define _GNU_SOURCE
@@ -136,92 +137,84 @@ static void refresh_environment(void) {
     setenv("DBUS_SESSION_BUS_ADDRESS", bus_path, 1);
 }
 
+/* Aguarda até o compositor Wayland estar pronto e com socket disponível */
+static bool wait_for_wayland(int timeout_seconds) {
+    for (int i = 0; i < timeout_seconds * 10; i++) {
+        char w_display[64];
+        detect_wayland_display(w_display, sizeof(w_display));
+        char test_path[512];
+        snprintf(test_path, sizeof(test_path), "%s/%s", g_runtime_dir, w_display);
+        if (access(test_path, F_OK) == 0) {
+            refresh_environment();
+            return true;
+        }
+        usleep(100000); /* 100ms */
+    }
+    return false;
+}
+
 /* Executa um comando silenciosamente */
 static void run_cmd_quiet(const char *cmd) {
     int ret = system(cmd);
     (void)ret;
 }
 
-/* Executa kscreen-doctor -j e analisa as saídas físicas e virtuais */
-static bool get_kwin_state(char physical_list[][64], int *num_phys, int max_phys) {
-    *num_phys = 0;
-    refresh_environment();
+/*
+ * Detecta monitor físico diretamente via kernel sysfs (/sys/class/drm/card*-* /status).
+ * Extremamente rápido (<10µs), sem dependência de Wayland/Qt/D-Bus, à prova de falhas.
+ */
+static bool has_drm_physical_monitor(char *primary_output, size_t max_len) {
+    DIR *dir = opendir("/sys/class/drm");
+    if (!dir) return false;
 
-    FILE *fp = popen("kscreen-doctor -j 2>/dev/null", "r");
-    if (!fp) {
-        log_msg("Erro ao executar kscreen-doctor");
-        return false;
-    }
+    struct dirent *entry;
+    bool found = false;
 
-    size_t cap = 8192;
-    size_t len = 0;
-    char *buf = malloc(cap);
-    if (!buf) {
-        pclose(fp);
-        return false;
-    }
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "card", 4) != 0) continue;
+        if (strchr(entry->d_name, '-') == NULL) continue;
+        if (strstr(entry->d_name, "Writeback") != NULL) continue;
 
-    char chunk[1024];
-    while (fgets(chunk, sizeof(chunk), fp)) {
-        size_t n = strlen(chunk);
-        if (len + n + 1 > cap) {
-            cap *= 2;
-            char *new_buf = realloc(buf, cap);
-            if (!new_buf) {
-                free(buf);
-                pclose(fp);
-                return false;
+        char status_path[512];
+        snprintf(status_path, sizeof(status_path), "/sys/class/drm/%s/status", entry->d_name);
+
+        FILE *f = fopen(status_path, "r");
+        if (!f) continue;
+
+        char status[32] = "";
+        if (fgets(status, sizeof(status), f)) {
+            size_t slen = strlen(status);
+            while (slen > 0 && (status[slen - 1] == '\n' || status[slen - 1] == '\r')) {
+                status[--slen] = '\0';
             }
-            buf = new_buf;
-        }
-        memcpy(buf + len, chunk, n);
-        len += n;
-        buf[len] = '\0';
-    }
-    pclose(fp);
-
-    if (len == 0) {
-        free(buf);
-        return false;
-    }
-
-    cJSON *root = cJSON_Parse(buf);
-    free(buf);
-    if (!root) {
-        return false;
-    }
-
-    cJSON *outputs = cJSON_GetObjectItem(root, "outputs");
-    if (cJSON_IsArray(outputs)) {
-        int count = cJSON_GetArraySize(outputs);
-        for (int i = 0; i < count; i++) {
-            cJSON *item = cJSON_GetArrayItem(outputs, i);
-            cJSON *name = cJSON_GetObjectItem(item, "name");
-            cJSON *conn = cJSON_GetObjectItem(item, "connected");
-
-            if (name && cJSON_IsString(name) && conn && cJSON_IsTrue(conn)) {
-                if (strstr(name->valuestring, "Virtual") == NULL) {
-                    if (*num_phys < max_phys) {
-                        snprintf(physical_list[*num_phys], 64, "%s", name->valuestring);
-                        (*num_phys)++;
+            if (strcmp(status, "connected") == 0) {
+                found = true;
+                if (primary_output && max_len > 0) {
+                    const char *dash = strchr(entry->d_name, '-');
+                    if (dash) {
+                        snprintf(primary_output, max_len, "%.63s", dash + 1);
+                    } else {
+                        snprintf(primary_output, max_len, "%.63s", entry->d_name);
                     }
                 }
+                fclose(f);
+                break;
             }
         }
+        fclose(f);
     }
-
-    cJSON_Delete(root);
-    return true;
+    closedir(dir);
+    return found;
 }
 
+/* Wrapper para checagem de monitor físico */
 static bool has_physical_monitor(void) {
-    char phys[16][64];
-    int count = 0;
-    if (get_kwin_state(phys, &count, 16)) {
-        if (count > 0) {
-            snprintf(g_last_physical_output, sizeof(g_last_physical_output), "%s", phys[0]);
-            return true;
+    char detected[64] = "";
+    if (has_drm_physical_monitor(detected, sizeof(detected))) {
+        if (detected[0] != '\0') {
+            snprintf(g_last_physical_output, sizeof(g_last_physical_output), "%s", detected);
         }
+        return true;
     }
     return false;
 }
@@ -232,7 +225,12 @@ static void start_vmon(void) {
     }
 
     log_msg("Monitor físico DESLIGADO detectado! Criando tela virtual %sx%s...", RES_W, RES_H);
-    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' 2>/dev/null");
+    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' >/dev/null 2>&1");
+
+    if (!wait_for_wayland(5)) {
+        log_msg("Aviso: Servidor Wayland não respondeu a tempo para criar tela virtual.");
+        return;
+    }
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -258,33 +256,73 @@ static void start_vmon(void) {
         _exit(1);
     } else if (pid > 0) {
         g_vmon_pid = pid;
-        usleep(600000); /* 0.6s para o KWin registrar */
+        usleep(800000); /* 0.8s para o KWin registrar a nova tela virtual */
 
+        refresh_environment();
         char doctor_cmd[512];
         snprintf(doctor_cmd, sizeof(doctor_cmd),
-                 "kscreen-doctor output.%s.enable output.%s.priority.1 output.%s.mode.%sx%s@%s 2>/dev/null",
+                 "kscreen-doctor output.%s.enable output.%s.priority.1 output.%s.mode.%sx%s@%s >/dev/null 2>&1",
                  VMON_OUTPUT, VMON_OUTPUT, VMON_OUTPUT, RES_W, RES_H, FPS);
         run_cmd_quiet(doctor_cmd);
 
         log_msg("Tela virtual %s ativa como tela principal (PID %d).", VMON_OUTPUT, (int)g_vmon_pid);
 
-        /* Reinicia o Sunshine para vincular à nova tela virtual se ele não estiver com display */
-        run_cmd_quiet("systemctl --user restart sunshine 2>/dev/null");
+        /* Reinicia o Sunshine para vincular à nova tela virtual */
+        run_cmd_quiet("systemctl --user restart sunshine >/dev/null 2>&1");
         log_msg("Sunshine pronto para conexões na tela virtual.");
     }
 }
 
 static void stop_vmon(void) {
-    log_msg("Monitor físico (%s) LIGADO detectado! Aguardando estabilização do hardware...", g_last_physical_output);
+    log_msg("Monitor físico (%s) LIGADO detectado! Aguardando estabilização do sinal DisplayPort...", g_last_physical_output);
 
-    /* Aguarda 2 segundos para o DisplayPort concluir link training naturalmente */
-    sleep(2);
+    /*
+     * Aguarda 2.5 segundos para que a placa AMD e o cabo DisplayPort completem o
+     * DPCD link training e a negociação DDC/EDID sem colisões de KMS no driver.
+     */
+    usleep(2500000);
 
-    /* Encerra a tela virtual de forma limpa */
+    refresh_environment();
+
+    /*
+     * REGRA DE OURO DA ESTABILIDADE:
+     * PASSO 1: Ativa o monitor físico e define-o como prioridade 1 ENQUANTO a tela virtual
+     * AINDA ESTÁ VIVA. Dessa forma o KWin NUNCA fica com 0 telas ativas, impedindo crashes
+     * do kwin_wayland e da sessão Plasma.
+     */
+    char doctor_cmd[512];
+    snprintf(doctor_cmd, sizeof(doctor_cmd),
+             "kscreen-doctor output.%.60s.enable output.%.60s.priority.1 >/dev/null 2>&1",
+             g_last_physical_output, g_last_physical_output);
+
+    bool activated = false;
+    for (int attempt = 1; attempt <= 4; attempt++) {
+        int ret = system(doctor_cmd);
+        if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
+            activated = true;
+            log_msg("Monitor físico %s ativado com sucesso como tela principal (tentativa %d).", g_last_physical_output, attempt);
+            break;
+        }
+        log_msg("Aguardando KWin aceitar ativação do monitor físico %s (tentativa %d)...", g_last_physical_output, attempt);
+        sleep(1);
+    }
+
+    if (!activated) {
+        log_msg("Aviso: Falha ao ativar monitor físico %s após tentativas. Mantendo tela virtual ativa por segurança.", g_last_physical_output);
+        return;
+    }
+
+    /* Aguarda 1.5s para o KWin renderizar as janelas e barras no monitor físico */
+    usleep(1500000);
+
+    /*
+     * PASSO 2: Agora que o monitor físico já é a tela principal ativa, encerra
+     * a tela virtual de forma segura e limpa.
+     */
     if (g_vmon_pid > 0) {
         kill(g_vmon_pid, SIGTERM);
         int status;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 15; i++) {
             if (waitpid(g_vmon_pid, &status, WNOHANG) > 0) {
                 break;
             }
@@ -296,13 +334,8 @@ static void stop_vmon(void) {
         }
         g_vmon_pid = -1;
     }
-    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' 2>/dev/null");
-    usleep(400000);
-
-    /* Garante prioridade no monitor físico sem forçar atomic enable redundante */
-    char doctor_cmd[256];
-    snprintf(doctor_cmd, sizeof(doctor_cmd), "kscreen-doctor output.%.60s.priority.1 2>/dev/null", g_last_physical_output);
-    run_cmd_quiet(doctor_cmd);
+    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' >/dev/null 2>&1");
+    usleep(300000);
 
     log_msg("Tela virtual encerrada. Imagem transferida para o monitor físico %s com sucesso.", g_last_physical_output);
 }
@@ -314,7 +347,7 @@ static void cleanup(void) {
         waitpid(g_vmon_pid, NULL, WNOHANG);
         g_vmon_pid = -1;
     }
-    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' 2>/dev/null");
+    run_cmd_quiet("pkill -f 'krfb-virtualmonitor.*" VMON_NAME "' >/dev/null 2>&1");
     log_msg("Daemon encerrado.");
 }
 
@@ -342,7 +375,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         if (strcmp(argv[1], "--version") == 0) {
-            printf("sunshine-display-daemon (C edition) v2.0\n");
+            printf("sunshine-display-daemon (C edition) v2.1\n");
             return 0;
         }
         if (strcmp(argv[1], "--help") == 0) {
@@ -371,10 +404,15 @@ int main(int argc, char *argv[]) {
 
     log_msg("Serviço sunshine-virtual-display (C edition) iniciado e ativo.");
 
+    /* Aguarda o Wayland estar pronto antes de prosseguir */
+    wait_for_wayland(5);
+
     bool was_physical_active = has_physical_monitor();
     if (!was_physical_active) {
         log_msg("Iniciando com monitor físico desligado. Criando tela virtual imediatamente...");
         start_vmon();
+    } else {
+        log_msg("Iniciando com monitor físico ativo (%s).", g_last_physical_output);
     }
 
     /* Socket Netlink para eventos de hotplug do kernel uevent */
@@ -408,7 +446,14 @@ int main(int argc, char *argv[]) {
             ret = poll(&pfd, 1, 1000);
             if (ret > 0 && (pfd.revents & POLLIN)) {
                 /* Consome buffer do netlink */
-                while (recv(nl_fd, nl_buf, sizeof(nl_buf), MSG_DONTWAIT) > 0);
+                ssize_t n = recv(nl_fd, nl_buf, sizeof(nl_buf) - 1, MSG_DONTWAIT);
+                if (n > 0) {
+                    nl_buf[n] = '\0';
+                    /* Se for uevent irrelevante (não drm/card), ignora */
+                    if (strstr(nl_buf, "drm") == NULL && strstr(nl_buf, "card") == NULL) {
+                        continue;
+                    }
+                }
             }
         } else {
             sleep(1);
@@ -423,7 +468,6 @@ int main(int argc, char *argv[]) {
             if (!physical_active) {
                 start_vmon();
             } else {
-                sleep(1); /* Aguarda estabilização do sinal de vídeo */
                 stop_vmon();
             }
             was_physical_active = physical_active;
