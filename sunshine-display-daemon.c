@@ -31,7 +31,7 @@
 #define VMON_OUTPUT "Virtual-sunshine-vmon"
 #define RES_W "1920"
 #define RES_H "1080"
-#define FPS "60"
+#define FPS "120"
 
 static volatile sig_atomic_t g_keep_running = 1;
 static pid_t g_vmon_pid = -1;
@@ -260,11 +260,11 @@ static void start_vmon(void) {
         refresh_environment();
         char doctor_cmd[512];
         snprintf(doctor_cmd, sizeof(doctor_cmd),
-                 "kscreen-doctor output.%s.enable output.%s.priority.1 output.%s.mode.%sx%s@%s >/dev/null 2>&1",
-                 VMON_OUTPUT, VMON_OUTPUT, VMON_OUTPUT, RES_W, RES_H, FPS);
+                 "kscreen-doctor output.%s.addCustomMode.%s.%s.120000.reduced output.%s.enable output.%s.priority.1 output.%s.mode.%sx%s@%s >/dev/null 2>&1",
+                 VMON_OUTPUT, RES_W, RES_H, VMON_OUTPUT, VMON_OUTPUT, VMON_OUTPUT, RES_W, RES_H, FPS);
         run_cmd_quiet(doctor_cmd);
 
-        log_msg("Tela virtual %s ativa como tela principal (PID %d).", VMON_OUTPUT, (int)g_vmon_pid);
+        log_msg("Tela virtual %s ativa em %sx%s@%sHz como tela principal (PID %d).", VMON_OUTPUT, RES_W, RES_H, FPS, (int)g_vmon_pid);
 
         /* Reinicia o Sunshine para vincular à nova tela virtual */
         run_cmd_quiet("systemctl --user restart sunshine >/dev/null 2>&1");
@@ -378,7 +378,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         if (strcmp(argv[1], "--version") == 0) {
-            printf("sunshine-display-daemon (C edition) v2.2\n");
+            printf("sunshine-display-daemon (C edition) v2.3\n");
             return 0;
         }
         if (strcmp(argv[1], "--help") == 0) {

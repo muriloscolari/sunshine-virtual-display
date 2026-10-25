@@ -15,7 +15,7 @@ Solução automatizada e de alta performance escrita em **C** para streaming com
 
 1. **Monitor Físico Desligado:**
    - O daemon detecta que não há monitor físico ativo no KWin.
-   - Cria imediatamente uma tela virtual **1920x1080 a 60Hz** usando o `krfb-virtualmonitor`.
+   - Cria imediatamente uma tela virtual **1920x1080 a 120Hz** usando o `krfb-virtualmonitor` e `kscreen-doctor`.
    - O Sunshine conecta à tela virtual sem exibir erros de falta de tela (`no wl_output found`).
    - Você conecta pelo Moonlight (celular, tablet, notebook) com imagem perfeita 1080p.
 
